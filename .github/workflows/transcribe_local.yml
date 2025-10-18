@@ -1,5 +1,8 @@
 name: Transcribe AWS Podcasts (whisper.cpp + auto-fetch, resumable)
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -26,6 +29,10 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+          fetch-depth: 0
 
       - name: Install tools
         run: |
@@ -213,9 +220,22 @@ jobs:
           PY
 
       - name: Commit transcripts
+        id: gitpush
+        continue-on-error: true
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/transcripts
           git commit -m "Add/Update AWS Podcast transcripts" || echo "No new transcripts"
           git push
+
+      - name: Create PR if push was blocked (403/branch protection)
+        if: steps.gitpush.outcome == 'failure'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/transcripts
+          commit-message: "Add/Update AWS Podcast transcripts"
+          title: "Add/Update AWS Podcast transcripts"
+          body: "Automated transcript update from workflow run."
+          labels: automation
