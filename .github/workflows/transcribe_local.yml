@@ -11,7 +11,7 @@ on:
         description: "Name to record as 'source' (e.g., AWS Official Podcast)"
         required: true
         default: "AWS Official Podcast"
-      # ✅ AWS Official Podcast RSS feed is included by default
+      # ✅ AWS Official Podcast RSS feed included by default
       feed_url:
         description: "RSS URL to pull MP3s (AWS Official Podcast)"
         required: false
@@ -71,7 +71,6 @@ jobs:
         run: |
           mkdir -p audio data/transcripts
 
-      # ---------- AUDIO via RSS (with metadata) ----------
       - name: Fetch audio from RSS
         env:
           FEED_URL: ${{ github.event.inputs.feed_url }}
@@ -93,7 +92,6 @@ jobs:
           for e in d.entries:
             if count >= max_items: break
             url = None
-            # Prefer enclosures; fallback to links
             for L in (getattr(e, "enclosures", []) or []):
               if L.get("type","").startswith("audio/") and L.get("href","").endswith(".mp3"):
                 url = L["href"]; break
@@ -122,7 +120,6 @@ jobs:
             except Exception as ex:
               print("Failed download:", url, ex)
 
-          # Save metadata for use in CSV
           os.makedirs("data/transcripts", exist_ok=True)
           with open("data/transcripts/rss_meta.tsv","w",encoding="utf-8") as f:
             for row in meta_lines:
@@ -130,7 +127,6 @@ jobs:
           print("Downloaded", count, "episodes; metadata written to data/transcripts/rss_meta.tsv")
           PY
 
-      # ---------- TRANSCRIBE (resumable & append) ----------
       - name: Transcribe with whisper.cpp (skip existing)
         env:
           SRC_DEFAULT: ${{ github.event.inputs.source_name }}
@@ -171,19 +167,4 @@ jobs:
               -of "data/transcripts/${stem}" \
               -ml 1
 
-            title="${TITLE_MAP[$base]:-$stem}"
-            date="${DATE_MAP[$base]:-}"
-            link="${LINK_MAP[$base]:-}"
-            src="${SRC_DEFAULT}"
-
-            echo "\"$src\",\"$title\",\"$date\",\"$link\",\"$out_txt\"" >> "$CSV"
-          done
-
-      - name: Commit transcripts
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/transcripts
-          git commit -m "Add/Update AWS Podcast transcripts" || echo "No new transcripts"
-          git push
-
+            title="${TITLE_MAP[$]()_
