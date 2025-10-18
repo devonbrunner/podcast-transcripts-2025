@@ -1,1 +1,189 @@
+name: Transcribe AWS Podcasts (whisper.cpp + auto-fetch, resumable)
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Whisper model (base.en, small.en, medium.en)"
+        required: true
+        default: "small.en"
+      source_name:
+        description: "Name to record as 'source' (e.g., AWS Official Podcast)"
+        required: true
+        default: "AWS Official Podcast"
+      # ✅ AWS Official Podcast RSS feed is included by default
+      feed_url:
+        description: "RSS URL to pull MP3s (AWS Official Podcast)"
+        required: false
+        default: "https://d3gih7jbfe3jlq.cloudfront.net/aws-podcast-feed.xml"
+      max_items:
+        description: "Max episodes to pull from RSS (if provided)"
+        required: false
+        default: "5"
+
+jobs:
+  transcribe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ffmpeg wget python3-pip
+          pip3 install feedparser python-dateutil
+
+      - name: Build whisper.cpp
+        run: |
+          git clone https://github.com/ggerganov/whisper.cpp.git
+          cd whisper.cpp && make
+
+      - name: Pick model URL
+        id: pickmodel
+        run: |
+          MODEL="${{ github.event.inputs.model }}"
+          case "$MODEL" in
+            base.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-base.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            small.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-small.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            medium.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-medium.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "Unsupported model: $MODEL"; exit 1
+              ;;
+          esac
+
+      - name: Download model
+        run: |
+          mkdir -p models
+          wget -q "${{ steps.pickmodel.outputs.url }}" -O "models/${{ steps.pickmodel.outputs.file }}"
+          ls -lh models/
+
+      - name: Prepare work dirs
+        run: |
+          mkdir -p audio data/transcripts
+
+      # ---------- AUDIO via RSS (with metadata) ----------
+      - name: Fetch audio from RSS
+        env:
+          FEED_URL: ${{ github.event.inputs.feed_url }}
+          MAX_ITEMS: ${{ github.event.inputs.max_items }}
+        run: |
+          python3 - << 'PY'
+          import os, re, urllib.request, feedparser
+          from dateutil import parser as dtp
+
+          feed_url = os.environ["FEED_URL"]
+          max_items = int(os.environ.get("MAX_ITEMS","5"))
+
+          print(f"Fetching AWS Podcast RSS: {feed_url}")
+          d = feedparser.parse(feed_url)
+          src_title = d.feed.get("title","AWS Official Podcast")
+          meta_lines = []
+          count = 0
+
+          for e in d.entries:
+            if count >= max_items: break
+            url = None
+            # Prefer enclosures; fallback to links
+            for L in (getattr(e, "enclosures", []) or []):
+              if L.get("type","").startswith("audio/") and L.get("href","").endswith(".mp3"):
+                url = L["href"]; break
+            if not url:
+              for L in (getattr(e, "links", []) or []):
+                if L.get("type","").startswith("audio/") and L.get("href","").endswith(".mp3"):
+                  url = L["href"]; break
+            if not url:
+              continue
+
+            title = e.get("title","episode").strip()
+            pub = ""
+            if hasattr(e, "published"):
+              try:
+                pub = dtp.parse(e.published).date().isoformat()
+              except Exception:
+                pub = e.get("published","")
+
+            fn = re.sub(r'[^a-zA-Z0-9._-]+','-', title)[:120] or "episode"
+            out = os.path.join("audio", f"{fn}.mp3")
+            print("Downloading:", url, "->", out)
+            try:
+              urllib.request.urlretrieve(url, out)
+              meta_lines.append((src_title, title, pub, getattr(e, "link", "") or url, out))
+              count += 1
+            except Exception as ex:
+              print("Failed download:", url, ex)
+
+          # Save metadata for use in CSV
+          os.makedirs("data/transcripts", exist_ok=True)
+          with open("data/transcripts/rss_meta.tsv","w",encoding="utf-8") as f:
+            for row in meta_lines:
+              f.write("\t".join(row) + "\n")
+          print("Downloaded", count, "episodes; metadata written to data/transcripts/rss_meta.tsv")
+          PY
+
+      # ---------- TRANSCRIBE (resumable & append) ----------
+      - name: Transcribe with whisper.cpp (skip existing)
+        env:
+          SRC_DEFAULT: ${{ github.event.inputs.source_name }}
+          MODEL_FILE: ${{ steps.pickmodel.outputs.file }}
+        run: |
+          CSV="data/transcripts/transcripts.csv"
+          if [ ! -f "$CSV" ]; then
+            echo "source,episode_title,episode_date,episode_link,transcript_path" > "$CSV"
+          fi
+
+          declare -A TITLE_MAP DATE_MAP LINK_MAP
+          if [ -f data/transcripts/rss_meta.tsv ]; then
+            while IFS=$'\t' read -r src title date link path; do
+              key=$(basename "$path")
+              TITLE_MAP["$key"]="$title"
+              DATE_MAP["$key"]="$date"
+              LINK_MAP["$key"]="$link"
+              SRC_DEFAULT="$src"
+            done < data/transcripts/rss_meta.tsv
+          fi
+
+          shopt -s nullglob
+          for f in audio/*.mp3; do
+            base=$(basename "$f")
+            stem="${base%.*}"
+            out_txt="data/transcripts/${stem}.txt"
+
+            if [ -f "$out_txt" ]; then
+              echo "Skip existing transcript: $out_txt"
+              continue
+            fi
+
+            echo "Transcribing: $f"
+            ./whisper.cpp/main \
+              -m "models/$MODEL_FILE" \
+              -f "$f" \
+              -otxt \
+              -of "data/transcripts/${stem}" \
+              -ml 1
+
+            title="${TITLE_MAP[$base]:-$stem}"
+            date="${DATE_MAP[$base]:-}"
+            link="${LINK_MAP[$base]:-}"
+            src="${SRC_DEFAULT}"
+
+            echo "\"$src\",\"$title\",\"$date\",\"$link\",\"$out_txt\"" >> "$CSV"
+          done
+
+      - name: Commit transcripts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/transcripts
+          git commit -m "Add/Update AWS Podcast transcripts" || echo "No new transcripts"
+          git push
 
