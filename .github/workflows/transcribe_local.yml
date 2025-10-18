@@ -12,13 +12,13 @@ on:
         required: true
         default: "small.en"
       source_name:
-        description: "Name to record as 'source' (e.g., AWS Official Podcast)"
+        description: "Name to record as 'source' (e.g., AWS Executive Insights Podcast)"
         required: true
         default: "AWS Official Podcast"
       feed_url:
-        description: "RSS URL to pull MP3s (AWS Official Podcast)"
+        description: "RSS URL to pull MP3s (AWS Executive Insights Podcast)"
         required: false
-        default: "https://d3gih7jbfe3jlq.cloudfront.net/aws-podcast-feed.xml"
+        default: "https://rss.art19.com/conversations-with-leaders"
       max_items:
         description: "Max episodes to pull from RSS"
         required: false
