@@ -102,6 +102,200 @@ jobs:
           for e in d.entries:
             if count >= max_items: break
             url = None
+            for L in (getattr(e, "enclosures", []) or []):
+              if L.get("type","", "").startswith("audio/") and L.get("href","").endswith(".mp3"):
+                url = L["href"]; break
+            if not url:
+              for L in (getattr(e, "links", []) or []):
+                if L.get("type","", "").startswith("audio/") and L.get("href","").endswith(".mp3"):
+                  url = L["href"]; break
+            if not url:
+              continue
+
+            title = (e.get("title","episode") or "episode").strip()
+            pub = ""
+            if hasattr(e, "published"):
+              try:
+                pub = dtp.parse(e.published).date().isoformat()
+              except Exception:
+                pub = e.get("published","")
+
+            fn = re.sub(r'[^a-zA-Z0-9._-]+','-', title)[:120] or "episode"
+            out = os.path.join("audio", f"{fn}.mp3")
+            print("Downloading:", url, "->", out)
+            try:
+              urllib.request.urlretrieve(url, out)
+              meta_lines.append((src_title, title, pub, getattr(e, "link", "") or url, out))
+              count += 1
+            except Exception as ex:
+              print("Failed download:", url, ex)
+
+          os.makedirs("data/transcripts", exist_ok=True)
+          with open("data/transcripts/rss_meta.tsv","w",encoding="utf-8") as f:
+            for row in meta_lines:
+              f.write("\t".join(row) + "\n")
+          print("Downloaded", count, "episodes; metadata written to data/transcripts/rss_meta.tsv")
+          PY
+
+      - name: Transcribe with whisper.cpp (skip existing)
+        env:
+          SRC_DEFAULT: ${{ github.event.inputs.source_name }}
+          MODEL_FILE: ${{ steps.pickmodel.outputs.file }}
+        run: |
+          python3 - << 'PY'
+          import os, csv, subprocess
+
+          SRC_DEFAULT = os.environ.get("SRC_DEFAULT","AWS Official Podcast")
+          MODEL_FILE  = os.environ["MODEL_FILE"]
+
+          os.makedirs("data/transcripts", exist_ok=True)
+          csv_path = "data/transcripts/transcripts.csv"
+
+          csv_exists = os.path.exists(csv_path)
+          out_rows = []
+          if csv_exists:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+              out_rows = list(csv.reader(f))
+          else:
+            out_rows.append(["source","episode_title","episode_date","episode_link","transcript_path"])
+
+          meta = {}
+          if os.path.exists("data/transcripts/rss_meta.tsv"):
+            with open("data/transcripts/rss_meta.tsv", encoding="utf-8") as f:
+              for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 5:
+                  src,title,date,link,path = parts
+                  meta[os.path.basename(path)] = (src or SRC_DEFAULT, title or os.path.splitext(os.path.basename(path))[0], date or "", link or "")
+
+          audio_dir = "audio"
+          any_audio = False
+          for name in sorted(os.listdir(audio_dir) if os.path.isdir(audio_dir) else []):
+            if not name.lower().endswith((".mp3",".m4a",".wav")):
+              continue
+            any_audio = True
+            in_path = os.path.join(audio_dir, name)
+            stem = os.path.splitext(name)[0]
+            out_txt = os.path.join("data","transcripts", f"{stem}.txt")
+
+            if os.path.exists(out_txt):
+              print(f"Skip existing transcript: {out_txt}")
+              continue
+
+            print(f"Transcribing: {in_path}")
+            cmd = [
+              "./whisper.cpp/main",
+              "-m", f"models/{MODEL_FILE}",
+              "-f", in_path,
+              "-otxt",
+              "-of", os.path.join("data","transcripts", stem),
+              "-ml", "1"
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            print(res.stdout)
+
+            src, title, date, link = meta.get(name, (SRC_DEFAULT, stem, "", ""))
+            out_rows.append([src, title, date, link, out_txt])
+
+          if not any_audio:
+            print("No audio files found to transcribe (did RSS fetch download any .mp3?).")
+
+          with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(out_rows)
+
+          print(f"Wrote CSV: {csv_path} ({len(out_rows)-1} rows of transcripts)")
+          PY
+
+      - name: Write run stamp (ensures PR exists)
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > data/transcripts/.last-run
+
+      # 🚫 Only include transcript files in the PR (avoid large model/audio files)
+      - name: Create/Update PR with transcripts
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/transcripts
+          add-paths: |
+            data/transcripts/**
+          commit-message: "Add/Update AWS Podcast transcripts"
+          title: "Add/Update AWS Podcast transcripts"
+          body: "Automated transcript update from workflow run."
+          labels: automation
+
+      - name: Show PR link
+        run: |
+          echo "PR URL: ${{ steps.cpr.outputs.pull-request-url }}"
+          echo "PR Number: ${{ steps.cpr.outputs.pull-request-number }}"
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ffmpeg wget python3-pip
+          pip3 install feedparser python-dateutil
+
+      - name: Build whisper.cpp
+        run: |
+          git clone https://github.com/ggerganov/whisper.cpp.git
+          cd whisper.cpp && make
+
+      - name: Pick model URL
+        id: pickmodel
+        run: |
+          MODEL="${{ github.event.inputs.model }}"
+          case "$MODEL" in
+            base.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-base.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            small.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-small.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            medium.en)
+              echo "url=https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.en.bin" >> $GITHUB_OUTPUT
+              echo "file=ggml-medium.en.bin" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "Unsupported model: $MODEL"; exit 1
+              ;;
+          esac
+
+      - name: Download model
+        run: |
+          mkdir -p models
+          wget -q "${{ steps.pickmodel.outputs.url }}" -O "models/${{ steps.pickmodel.outputs.file }}"
+          ls -lh models/
+
+      - name: Prepare work dirs
+        run: |
+          mkdir -p audio data/transcripts
+
+      - name: Fetch audio from RSS
+        env:
+          FEED_URL: ${{ github.event.inputs.feed_url }}
+          MAX_ITEMS: ${{ github.event.inputs.max_items }}
+        run: |
+          python3 - << 'PY'
+          import os, re, urllib.request, feedparser
+          from dateutil import parser as dtp
+
+          feed_url = os.environ.get("FEED_URL","").strip()
+          max_items = int(os.environ.get("MAX_ITEMS","5") or "5")
+          if not feed_url:
+              print("No feed_url provided; skipping RSS fetch.")
+              raise SystemExit(0)
+
+          print(f"Fetching AWS Podcast RSS: {feed_url}")
+          d = feedparser.parse(feed_url)
+          src_title = d.feed.get("title","AWS Official Podcast")
+          meta_lines = []
+          count = 0
+
+          for e in d.entries:
+            if count >= max_items: break
+            url = None
             # Prefer enclosures; fallback to links
             for L in (getattr(e, "enclosures", []) or []):
               if L.get("type","", "").startswith("audio/") and L.get("href","").endswith(".mp3"):
