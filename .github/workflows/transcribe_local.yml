@@ -11,7 +11,6 @@ on:
         description: "Name to record as 'source' (e.g., AWS Official Podcast)"
         required: true
         default: "AWS Official Podcast"
-      # ✅ AWS Official Podcast RSS feed included by default
       feed_url:
         description: "RSS URL to pull MP3s (AWS Official Podcast)"
         required: false
@@ -80,8 +79,11 @@ jobs:
           import os, re, urllib.request, feedparser
           from dateutil import parser as dtp
 
-          feed_url = os.environ["FEED_URL"]
-          max_items = int(os.environ.get("MAX_ITEMS","5"))
+          feed_url = os.environ.get("FEED_URL","").strip()
+          max_items = int(os.environ.get("MAX_ITEMS","5") or "5")
+          if not feed_url:
+              print("No feed_url provided; skipping RSS fetch.")
+              raise SystemExit(0)
 
           print(f"Fetching AWS Podcast RSS: {feed_url}")
           d = feedparser.parse(feed_url)
@@ -92,17 +94,18 @@ jobs:
           for e in d.entries:
             if count >= max_items: break
             url = None
+            # Prefer enclosures; fallback to links
             for L in (getattr(e, "enclosures", []) or []):
-              if L.get("type","").startswith("audio/") and L.get("href","").endswith(".mp3"):
+              if L.get("type","", "").startswith("audio/") and L.get("href","").endswith(".mp3"):
                 url = L["href"]; break
             if not url:
               for L in (getattr(e, "links", []) or []):
-                if L.get("type","").startswith("audio/") and L.get("href","").endswith(".mp3"):
+                if L.get("type","", "").startswith("audio/") and L.get("href","").endswith(".mp3"):
                   url = L["href"]; break
             if not url:
               continue
 
-            title = e.get("title","episode").strip()
+            title = (e.get("title","episode") or "episode").strip()
             pub = ""
             if hasattr(e, "published"):
               try:
@@ -127,44 +130,92 @@ jobs:
           print("Downloaded", count, "episodes; metadata written to data/transcripts/rss_meta.tsv")
           PY
 
+      # --------- Transcribe (Python wrapper; resumable & append) -----------
       - name: Transcribe with whisper.cpp (skip existing)
         env:
           SRC_DEFAULT: ${{ github.event.inputs.source_name }}
           MODEL_FILE: ${{ steps.pickmodel.outputs.file }}
         run: |
-          CSV="data/transcripts/transcripts.csv"
-          if [ ! -f "$CSV" ]; then
-            echo "source,episode_title,episode_date,episode_link,transcript_path" > "$CSV"
-          fi
+          python3 - << 'PY'
+          import os, csv, subprocess, sys
 
-          declare -A TITLE_MAP DATE_MAP LINK_MAP
-          if [ -f data/transcripts/rss_meta.tsv ]; then
-            while IFS=$'\t' read -r src title date link path; do
-              key=$(basename "$path")
-              TITLE_MAP["$key"]="$title"
-              DATE_MAP["$key"]="$date"
-              LINK_MAP["$key"]="$link"
-              SRC_DEFAULT="$src"
-            done < data/transcripts/rss_meta.tsv
-          fi
+          SRC_DEFAULT = os.environ.get("SRC_DEFAULT","AWS Official Podcast")
+          MODEL_FILE  = os.environ["MODEL_FILE"]
 
-          shopt -s nullglob
-          for f in audio/*.mp3; do
-            base=$(basename "$f")
-            stem="${base%.*}"
-            out_txt="data/transcripts/${stem}.txt"
+          os.makedirs("data/transcripts", exist_ok=True)
+          csv_path = "data/transcripts/transcripts.csv"
 
-            if [ -f "$out_txt" ]; then
-              echo "Skip existing transcript: $out_txt"
+          # Make/keep CSV
+          csv_exists = os.path.exists(csv_path)
+          out_rows = []
+          if csv_exists:
+            with open(csv_path, newline="", encoding="utf-8") as f:
+              for row in csv.reader(f):
+                out_rows.append(row)
+          else:
+            out_rows.append(["source","episode_title","episode_date","episode_link","transcript_path"])
+
+          # Load metadata if present
+          meta = {}  # key: basename(file path) -> (source,title,date,link)
+          def load_meta(tsv_path):
+            if not os.path.exists(tsv_path): return
+            with open(tsv_path, encoding="utf-8") as f:
+              for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) != 5: 
+                  continue
+                src,title,date,link,path = parts
+                key = os.path.basename(path)
+                meta[key] = (src or SRC_DEFAULT, title or os.path.splitext(key)[0], date or "", link or "")
+
+          load_meta("data/transcripts/rss_meta.tsv")
+
+          # Iterate audio files
+          audio_dir = "audio"
+          any_audio = False
+          for name in sorted(os.listdir(audio_dir) if os.path.isdir(audio_dir) else []):
+            if not name.lower().endswith((".mp3",".m4a",".wav")):
               continue
-            fi
+            any_audio = True
+            in_path = os.path.join(audio_dir, name)
+            stem = os.path.splitext(name)[0]
+            out_txt = os.path.join("data","transcripts", f"{stem}.txt")
 
-            echo "Transcribing: $f"
-            ./whisper.cpp/main \
-              -m "models/$MODEL_FILE" \
-              -f "$f" \
-              -otxt \
-              -of "data/transcripts/${stem}" \
-              -ml 1
+            # Skip if transcript already exists
+            if os.path.exists(out_txt):
+              print(f"Skip existing transcript: {out_txt}")
+              continue
 
-            title="${TITLE_MAP[$]()_
+            print(f"Transcribing: {in_path}")
+            cmd = [
+              "./whisper.cpp/main",
+              "-m", f"models/{MODEL_FILE}",
+              "-f", in_path,
+              "-otxt",
+              "-of", os.path.join("data","transcripts", stem),
+              "-ml", "1"
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            print(res.stdout)
+
+            # Build CSV row from meta or defaults
+            src, title, date, link = meta.get(name, (SRC_DEFAULT, stem, "", ""))
+            out_rows.append([src, title, date, link, out_txt])
+
+          if not any_audio:
+            print("No audio files found to transcribe (did RSS fetch download any .mp3?).")
+
+          # Write CSV back (append-safe)
+          with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(out_rows)
+
+          print(f"Wrote CSV: {csv_path} ({len(out_rows)-1} rows of transcripts)")
+          PY
+
+      - name: Commit transcripts
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/transcripts
+          git commit -m "Add/Update AWS Podcast transcripts" || echo "No new transcripts"
+          git push
