@@ -1,7 +1,8 @@
 name: Transcribe AWS Podcasts (whisper.cpp + auto-fetch, resumable)
 
 permissions:
-  contents: write
+  contents: write         # needed to push a branch
+  pull-requests: write    # needed to open/update a PR
 
 on:
   workflow_dispatch:
@@ -144,7 +145,7 @@ jobs:
           MODEL_FILE: ${{ steps.pickmodel.outputs.file }}
         run: |
           python3 - << 'PY'
-          import os, csv, subprocess, sys
+          import os, csv, subprocess
 
           SRC_DEFAULT = os.environ.get("SRC_DEFAULT","AWS Official Podcast")
           MODEL_FILE  = os.environ["MODEL_FILE"]
@@ -157,25 +158,19 @@ jobs:
           out_rows = []
           if csv_exists:
             with open(csv_path, newline="", encoding="utf-8") as f:
-              for row in csv.reader(f):
-                out_rows.append(row)
+              out_rows = list(csv.reader(f))
           else:
             out_rows.append(["source","episode_title","episode_date","episode_link","transcript_path"])
 
           # Load metadata if present
           meta = {}  # key: basename(file path) -> (source,title,date,link)
-          def load_meta(tsv_path):
-            if not os.path.exists(tsv_path): return
-            with open(tsv_path, encoding="utf-8") as f:
+          if os.path.exists("data/transcripts/rss_meta.tsv"):
+            with open("data/transcripts/rss_meta.tsv", encoding="utf-8") as f:
               for line in f:
                 parts = line.rstrip("\n").split("\t")
-                if len(parts) != 5: 
-                  continue
-                src,title,date,link,path = parts
-                key = os.path.basename(path)
-                meta[key] = (src or SRC_DEFAULT, title or os.path.splitext(key)[0], date or "", link or "")
-
-          load_meta("data/transcripts/rss_meta.tsv")
+                if len(parts) == 5:
+                  src,title,date,link,path = parts
+                  meta[os.path.basename(path)] = (src or SRC_DEFAULT, title or os.path.splitext(os.path.basename(path))[0], date or "", link or "")
 
           # Iterate audio files
           audio_dir = "audio"
@@ -219,18 +214,14 @@ jobs:
           print(f"Wrote CSV: {csv_path} ({len(out_rows)-1} rows of transcripts)")
           PY
 
-      - name: Commit transcripts
-        id: gitpush
-        continue-on-error: true
+      # --------- Ensure there's always a change so a PR is created ----------
+      - name: Write run stamp (ensures PR exists)
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/transcripts
-          git commit -m "Add/Update AWS Podcast transcripts" || echo "No new transcripts"
-          git push
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > data/transcripts/.last-run
 
-      - name: Create PR if push was blocked (403/branch protection)
-        if: steps.gitpush.outcome == 'failure'
+      # --------- Always create/update a Pull Request with the changes -------
+      - name: Create/Update PR with transcripts
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -239,3 +230,8 @@ jobs:
           title: "Add/Update AWS Podcast transcripts"
           body: "Automated transcript update from workflow run."
           labels: automation
+
+      - name: Show PR link
+        run: |
+          echo "PR URL: ${{ steps.cpr.outputs.pull-request-url }}"
+          echo "PR Number: ${{ steps.cpr.outputs.pull-request-number }}"
